@@ -188,7 +188,7 @@ where
 
         // Perform the actual RMT operation. We use the u32 values here right away.
         let channel = self.channel.take().unwrap();
-        match channel.transmit(&self.rmt_buffer).wait() {
+        match channel.transmit(self.rmt_buffer.iter().cloned()).wait() {
             Ok(chan) => {
                 self.channel = Some(chan);
                 Ok(())
