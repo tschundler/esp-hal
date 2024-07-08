@@ -449,57 +449,66 @@ where
 }
 
 /// An in-progress transaction for a single shot TX transaction.
-pub struct SingleShotTxTransaction<'a, C, T: Into<u32> + Copy>
+pub struct SingleShotTxTransaction<'a, C, D, T: Into<u32> + Copy + 'a>
 where
     C: TxChannel,
+    D: Iterator<Item = &'a T> + 'a,
 {
     channel: C,
-    index: usize,
-    data: &'a [T],
+    data: D,
 }
 
-impl<'a, C, T: Into<u32> + Copy> SingleShotTxTransaction<'a, C, T>
+impl<'a, C, D, T: Into<u32> + Copy + 'a> SingleShotTxTransaction<'a, C, D, T>
 where
     C: TxChannel,
+    D: Iterator<Item = &'a T> + 'a,
 {
     /// Wait for the transaction to complete
+    #[inline(never)]
     pub fn wait(mut self) -> Result<C, (Error, C)> {
-        loop {
-            if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
-                return Err((Error::TransmissionError, self.channel));
-            }
+        let mut ram_index: usize = 0;
+        'filler: loop {
+            // wait for TX-THR
+            loop {
+                if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
+                    return Err((Error::TransmissionError, self.channel));
+                }
 
-            if self.index < self.data.len() {
-                // wait for TX-THR
-                loop {
-                    if <C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
+                if <C as private::TxChannelInternal<crate::Blocking>>::is_done() {
+                    return Ok(self.channel);
+                }
+                if <C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
+                    break;
+                }
+            }
+            <C as private::TxChannelInternal<crate::Blocking>>::reset_threshold_set();
+
+            // re-fill RX RAM
+            let ptr = (constants::RMT_RAM_START
+                + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4)
+                as *mut u32;
+
+            if ram_index >= (constants::RMT_CHANNEL_RAM_SIZE) {
+                ram_index = 0
+            }
+            loop {
+                let Some(v) = self.data.next() else {
+                    break 'filler;
+                };
+                unsafe {
+                    ptr.add(ram_index).write_volatile((*v).into());
+                }
+                ram_index += 1;
+                match ram_index {
+                    constants::RMT_CHANNEL_RAM_SIZE => {
+                        ram_index = 0;
                         break;
                     }
-                }
-                <C as private::TxChannelInternal<crate::Blocking>>::reset_threshold_set();
-
-                // re-fill TX RAM
-                let ram_index = (((self.index - constants::RMT_CHANNEL_RAM_SIZE)
-                    / (constants::RMT_CHANNEL_RAM_SIZE / 2))
-                    % 2)
-                    * (constants::RMT_CHANNEL_RAM_SIZE / 2);
-
-                let ptr = (constants::RMT_RAM_START
-                    + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4
-                    + ram_index * 4) as *mut u32;
-                for (idx, entry) in self.data[self.index..]
-                    .iter()
-                    .take(constants::RMT_CHANNEL_RAM_SIZE / 2)
-                    .enumerate()
-                {
-                    unsafe {
-                        ptr.add(idx).write_volatile((*entry).into());
+                    s if s == (constants::RMT_CHANNEL_RAM_SIZE / 2) => {
+                        break;
                     }
+                    _ => {}
                 }
-
-                self.index += constants::RMT_CHANNEL_RAM_SIZE / 2;
-            } else {
-                break;
             }
         }
 
@@ -988,14 +997,35 @@ pub trait TxChannel: private::TxChannelInternal<crate::Blocking> {
     /// This returns a [`SingleShotTxTransaction`] which can be used to wait for
     /// the transaction to complete and get back the channel for further
     /// use.
-    fn transmit<T: Into<u32> + Copy>(self, data: &[T]) -> SingleShotTxTransaction<Self, T>
+    // fn transmit<'a, T: Into<u32> + Copy>(
+    //     self,
+    //     data: D,
+    // ) -> SingleShotTxTransaction<'a, Self, D, T>
+    // where
+    //     Self: Sized,
+    //     D: &[T] + 'a,
+    // {
+    //     let index = Self::send_raw(data, false, 0);
+    //     SingleShotTxTransaction {
+    //         channel: self,
+    //         index,
+    //         data,
+    //     }
+    // }
+
+    fn transmit<'a, D, R, T: Into<u32> + Copy + 'a>(
+        self,
+        data: D,
+    ) -> SingleShotTxTransaction<'a, Self, R, T>
     where
         Self: Sized,
+        D: IntoIterator<Item = &'a T, IntoIter = R> + 'a,
+        R: Iterator<Item = &'a T> + 'a,
     {
-        let index = Self::send_raw(data, false, 0);
+        let mut data = data.into_iter();
+        Self::send_raw(&mut data, false, 0);
         SingleShotTxTransaction {
             channel: self,
-            index,
             data,
         }
     }
@@ -1029,7 +1059,7 @@ pub trait TxChannel: private::TxChannelInternal<crate::Blocking> {
             return Err(Error::Overflow);
         }
 
-        let _index = Self::send_raw(data, true, loopcount);
+        Self::send_raw(&mut data.into_iter(), true, loopcount);
         Ok(ContinuousTxTransaction { channel: self })
     }
 }
@@ -1159,18 +1189,16 @@ pub mod asynch {
         /// Start transmitting the given pulse code sequence.
         /// The length of sequence cannot exceed the size of the allocated RMT
         /// RAM.
-        async fn transmit<'a, T: Into<u32> + Copy>(&mut self, data: &'a [T]) -> Result<(), Error>
+        async fn transmit<'a, D, T: Into<u32> + Copy + 'a>(&mut self, data: D) -> Result<(), Error>
         where
             Self: Sized,
+            D: IntoIterator<Item = &'a T> + 'a,
         {
-            if data.len() > constants::RMT_CHANNEL_RAM_SIZE {
-                return Err(Error::InvalidArgument);
-            }
-
             Self::clear_interrupts();
             Self::listen_interrupt(super::private::Event::End);
             Self::listen_interrupt(super::private::Event::Error);
-            Self::send_raw(data, false, 0);
+            let mut data = data.into_iter();
+            Self::send_raw(&mut data, false, 0);
 
             RmtTxFuture::new(self).await;
 
@@ -1493,20 +1521,23 @@ mod private {
 
         fn is_loopcount_interrupt_set() -> bool;
 
-        fn send_raw<T: Into<u32> + Copy>(data: &[T], continuous: bool, repeat: u16) -> usize {
+        fn send_raw<'a, T: Into<u32> + Copy + 'a>(
+            data: &mut (impl Iterator<Item = &'a T> + 'a),
+            continuous: bool,
+            repeat: u16,
+        ) -> usize {
             Self::clear_interrupts();
 
             let ptr = (constants::RMT_RAM_START
                 + Self::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4)
                 as *mut u32;
-            for (idx, entry) in data
-                .iter()
-                .take(constants::RMT_CHANNEL_RAM_SIZE)
-                .enumerate()
-            {
+
+            let mut sent = 0;
+            for (idx, entry) in data.take(constants::RMT_CHANNEL_RAM_SIZE).enumerate() {
                 unsafe {
                     ptr.add(idx).write_volatile((*entry).into());
                 }
+                sent = idx;
             }
 
             Self::set_threshold((constants::RMT_CHANNEL_RAM_SIZE / 2) as u8);
@@ -1518,11 +1549,7 @@ mod private {
             Self::start_tx();
             Self::update();
 
-            if data.len() >= constants::RMT_CHANNEL_RAM_SIZE {
-                constants::RMT_CHANNEL_RAM_SIZE
-            } else {
-                data.len()
-            }
+            sent
         }
 
         fn stop();
