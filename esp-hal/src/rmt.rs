@@ -467,7 +467,9 @@ where
     #[inline(never)]
     pub fn wait(mut self) -> Result<C, (Error, C)> {
         let mut ram_index: usize = 0;
-        'filler: loop {
+        // code below relies on Next always returning None once the iterator is exhausted.
+        let mut data = self.data.fuse();
+        loop {
             // wait for TX-THR
             loop {
                 if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
@@ -492,8 +494,8 @@ where
                 ram_index = 0
             }
             loop {
-                let Some(v) = self.data.next() else {
-                    break 'filler;
+                let Some(v) = data.next() else {
+                    break;
                 };
                 unsafe {
                     ptr.add(ram_index).write_volatile((*v).into());
@@ -511,18 +513,6 @@ where
                 }
             }
         }
-
-        loop {
-            if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
-                return Err((Error::TransmissionError, self.channel));
-            }
-
-            if <C as private::TxChannelInternal<crate::Blocking>>::is_done() {
-                break;
-            }
-        }
-
-        Ok(self.channel)
     }
 }
 
