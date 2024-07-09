@@ -24,7 +24,7 @@
 #![deny(missing_docs)]
 #![no_std]
 
-use core::{fmt::Debug, slice::IterMut};
+use core::{fmt::Debug, iter::FusedIterator, slice::IterMut};
 
 use esp_hal::{
     clock::Clocks,
@@ -39,6 +39,7 @@ const SK68XX_T0H_NS: u32 = 320;
 const SK68XX_T0L_NS: u32 = SK68XX_CODE_PERIOD - SK68XX_T0H_NS;
 const SK68XX_T1H_NS: u32 = 640;
 const SK68XX_T1L_NS: u32 = SK68XX_CODE_PERIOD - SK68XX_T1H_NS;
+const SK68XX_TLATCH_NS: u32 = 20000;
 
 /// All types of errors that can happen during the conversion and transmission
 /// of LED commands
@@ -69,18 +70,131 @@ macro_rules! smartLedBuffer {
     };
 }
 
+struct ByteGenerator<T>
+where
+    T: Iterator<Item = RGB8>,
+{
+    source: T,
+    val: RGB8,
+    bit: u8,
+}
+
+impl<T> Iterator for ByteGenerator<T>
+where
+    T: Iterator<Item = RGB8>,
+{
+    type Item = u8;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bit == 0 {
+            self.val = self.source.next()?;
+            self.bit = 3;
+        }
+        self.bit -= 1;
+        Some(match self.bit {
+            0 => self.val.b,
+            1 => self.val.r,
+            _ => self.val.g,
+        })
+    }
+}
+
+impl<T> ByteGenerator<T>
+where
+    T: Iterator<Item = RGB8>,
+{
+    fn new(source: T) -> Self {
+        Self {
+            source,
+            val: RGB8 { r: 0, g: 0, b: 0 },
+            bit: 0,
+        }
+    }
+}
+
+enum PulseState {
+    Running,
+    SendStop,
+    Done,
+}
+
+struct PulseGenerator<T>
+where
+    T: Iterator<Item = u8>,
+{
+    source: T,
+    pulses: (u32, u32),
+    bit: u8,
+    val: u8,
+    state: PulseState,
+}
+
+impl<T> PulseGenerator<T>
+where
+    T: Iterator<Item = u8>,
+{
+    fn new(source: T, pulses: (u32, u32)) -> Self {
+        Self {
+            source,
+            pulses,
+            bit: 0,
+            val: 0,
+            state: PulseState::Running,
+        }
+    }
+}
+
+impl<T> Iterator for PulseGenerator<T>
+where
+    T: Iterator<Item = u8>,
+{
+    type Item = u32;
+
+    #[inline(never)]
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.bit == 0 {
+            match self.state {
+                PulseState::Running => {
+                    let Some(v) = self.source.next() else {
+                        self.state = PulseState::SendStop;
+                        // should send latch delay
+                        return Some(0);
+                    };
+                    self.val = v;
+                    self.bit = 8;
+                }
+                PulseState::SendStop => {
+                    self.state = PulseState::Done;
+                    return Some(0);
+                }
+                PulseState::Done => return None,
+            }
+        }
+        let result = if self.val & 128 != 0 {
+            self.pulses.1
+        } else {
+            self.pulses.0
+        };
+        self.bit -= 1;
+        self.val <<= 1;
+
+        Some(result)
+    }
+}
+
+impl<T> FusedIterator for PulseGenerator<T> where T: Iterator<Item = u8> {}
+
 /// Adapter taking an RMT channel and a specific pin and providing RGB LED
 /// interaction functionality using the `smart-leds` crate
-pub struct SmartLedsAdapter<TX, const BUFFER_SIZE: usize>
+pub struct SmartLedsAdapter<TX>
 where
     TX: TxChannel,
 {
     channel: Option<TX>,
-    rmt_buffer: [u32; BUFFER_SIZE],
     pulses: (u32, u32),
 }
 
-impl<'d, TX, const BUFFER_SIZE: usize> SmartLedsAdapter<TX, BUFFER_SIZE>
+impl<'d, TX> SmartLedsAdapter<TX>
 where
     TX: TxChannel,
 {
@@ -88,9 +202,8 @@ where
     pub fn new<C, O>(
         channel: C,
         pin: impl Peripheral<P = O> + 'd,
-        rmt_buffer: [u32; BUFFER_SIZE],
         clocks: &Clocks,
-    ) -> SmartLedsAdapter<TX, BUFFER_SIZE>
+    ) -> SmartLedsAdapter<TX>
     where
         O: OutputPin + 'd,
         C: TxChannelCreator<'d, TX, O>,
@@ -111,7 +224,6 @@ where
 
         Self {
             channel: Some(channel),
-            rmt_buffer,
             pulses: (
                 u32::from(PulseCode {
                     level1: true,
@@ -128,37 +240,9 @@ where
             ),
         }
     }
-
-    fn convert_rgb_to_pulse(
-        value: RGB8,
-        mut_iter: &mut IterMut<u32>,
-        pulses: (u32, u32),
-    ) -> Result<(), LedAdapterError> {
-        Self::convert_rgb_channel_to_pulses(value.g, mut_iter, pulses)?;
-        Self::convert_rgb_channel_to_pulses(value.r, mut_iter, pulses)?;
-        Self::convert_rgb_channel_to_pulses(value.b, mut_iter, pulses)?;
-
-        Ok(())
-    }
-
-    fn convert_rgb_channel_to_pulses(
-        channel_value: u8,
-        mut_iter: &mut IterMut<u32>,
-        pulses: (u32, u32),
-    ) -> Result<(), LedAdapterError> {
-        for position in [128, 64, 32, 16, 8, 4, 2, 1] {
-            *mut_iter.next().ok_or(LedAdapterError::BufferSizeExceeded)? =
-                match channel_value & position {
-                    0 => pulses.0,
-                    _ => pulses.1,
-                }
-        }
-
-        Ok(())
-    }
 }
 
-impl<TX, const BUFFER_SIZE: usize> SmartLedsWrite for SmartLedsAdapter<TX, BUFFER_SIZE>
+impl<TX> SmartLedsWrite for SmartLedsAdapter<TX>
 where
     TX: TxChannel,
 {
@@ -173,22 +257,12 @@ where
         T: IntoIterator<Item = I>,
         I: Into<Self::Color>,
     {
-        // We always start from the beginning of the buffer
-        let mut seq_iter = self.rmt_buffer.iter_mut();
-
-        // Add all converted iterator items to the buffer.
-        // This will result in an `BufferSizeExceeded` error in case
-        // the iterator provides more elements than the buffer can take.
-        for item in iterator {
-            Self::convert_rgb_to_pulse(item.into(), &mut seq_iter, self.pulses)?;
-        }
-
-        // Finally, add an end element.
-        *seq_iter.next().ok_or(LedAdapterError::BufferSizeExceeded)? = 0;
-
-        // Perform the actual RMT operation. We use the u32 values here right away.
         let channel = self.channel.take().unwrap();
-        match channel.transmit(self.rmt_buffer.iter().cloned()).wait() {
+        let mut itr = PulseGenerator::new(
+            ByteGenerator::new(iterator.into_iter().map(|v| v.into())),
+            self.pulses,
+        );
+        match channel.transmit(&mut itr).wait() {
             Ok(chan) => {
                 self.channel = Some(chan);
                 Ok(())
