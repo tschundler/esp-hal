@@ -75,7 +75,7 @@
 
 #![warn(missing_docs)]
 
-use core::marker::PhantomData;
+use core::{iter::Fuse, marker::PhantomData};
 
 use fugit::HertzU32;
 
@@ -457,7 +457,8 @@ where
     D: Iterator<Item = T>,
 {
     channel: C,
-    data: D,
+    data: Fuse<D>,
+    ram_index: usize,
 }
 
 impl<C, D, T: Into<u32> + Copy> SingleShotTxTransaction<C, D, T>
@@ -467,50 +468,53 @@ where
 {
     /// Wait for the transaction to complete
     #[inline(never)]
-    pub fn wait(mut self) -> Result<C, (Error, C)> {
-        let mut ram_index: usize = 0;
-        // code below relies on Next always returning None once the iterator is exhausted.
-        let mut data = self.data.fuse();
+    pub fn poll(&mut self) -> Option<Result<(), Error>> {
+        if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
+            return Some(Err(Error::TransmissionError));
+        }
+
+        if <C as private::TxChannelInternal<crate::Blocking>>::is_done() {
+            return Some(Ok(()));
+        }
+        if !<C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
+            return None;
+        }
+        <C as private::TxChannelInternal<crate::Blocking>>::reset_threshold_set();
+
+        // re-fill RX RAM
+        let ptr = (constants::RMT_RAM_START
+            + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4)
+            as *mut u32;
+
         loop {
-            let mut c = 0;
-            // wait for TX-THR
-            loop {
-                if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
-                    return Err((Error::TransmissionError, self.channel));
-                }
-
-                if <C as private::TxChannelInternal<crate::Blocking>>::is_done() {
-                    return Ok(self.channel);
-                }
-                if <C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
-                    break;
-                }
-                c += 1;
+            let Some(v) = self.data.next() else {
+                break;
+            };
+            unsafe {
+                ptr.add(self.ram_index).write_volatile(v.into());
             }
-            <C as private::TxChannelInternal<crate::Blocking>>::reset_threshold_set();
-            if c == 0 {
-                return Err((Error::Underflow, self.channel));
+            self.ram_index += 1;
+            if self.ram_index == constants::RMT_CHANNEL_RAM_SIZE {
+                self.ram_index = 0;
+                break;
             }
-
-            // re-fill RX RAM
-            let ptr = (constants::RMT_RAM_START
-                + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4)
-                as *mut u32;
-
-            loop {
-                let Some(v) = data.next() else {
-                    break;
-                };
-                unsafe {
-                    ptr.add(ram_index).write_volatile(v.into());
-                }
-                ram_index += 1;
-                if ram_index == constants::RMT_CHANNEL_RAM_SIZE {
-                    ram_index = 0;
-                    break;
-                }
-                if ram_index == (constants::RMT_CHANNEL_RAM_SIZE / 2) {
-                    break;
+            if self.ram_index == (constants::RMT_CHANNEL_RAM_SIZE / 2) {
+                break;
+            }
+        }
+        if <C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
+            return Some(Err(Error::Underflow));
+        }
+        None
+    }
+    /// Wait for the transaction to complete
+    #[inline(never)]
+    pub fn wait(mut self) -> Result<C, (Error, C)> {
+        loop {
+            if let Some(result) = self.poll() {
+                match result {
+                    Ok(()) => return Ok(self.channel),
+                    Err(e) => return Err((e, self.channel)),
                 }
             }
         }
@@ -1014,7 +1018,8 @@ pub trait TxChannel: private::TxChannelInternal<crate::Blocking> {
         Self::send_raw(&mut data, false, 0);
         SingleShotTxTransaction {
             channel: self,
-            data,
+            data: data.fuse(),
+            ram_index: 0,
         }
     }
 
