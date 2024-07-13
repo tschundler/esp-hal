@@ -288,7 +288,10 @@ impl<'d> Rmt<'d, crate::Async> {
         _clocks: &Clocks,
     ) -> Result<Self, Error> {
         Self::new_internal(
-            peripheral, frequency, _clocks, None, //Some(asynch::async_interrupt_handler),
+            peripheral,
+            frequency,
+            _clocks,
+            Some(asynch::async_interrupt_handler),
         )
     }
 }
@@ -1175,7 +1178,8 @@ pub mod asynch {
         type Output = Result<(), Error>;
 
         fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-            //WAKER[C::CHANNEL as usize].register(ctx.waker());
+            WAKER[C::CHANNEL as usize].register(ctx.waker());
+            //
 
             if C::is_error() {
                 return Poll::Ready(Err(Error::TransmissionError));
@@ -1187,9 +1191,12 @@ pub mod asynch {
 
             // never gets set :|
             if !C::is_threshold_set() {
+                C::clear_interrupts();
                 return Poll::Pending;
             }
+            panic!("loop");
             C::reset_threshold_set();
+            C::clear_interrupts();
 
             // re-fill TX RAM
             let ptr = (constants::RMT_RAM_START
@@ -1215,6 +1222,7 @@ pub mod asynch {
             if C::is_threshold_set() {
                 return Poll::Ready(Err(Error::Underflow));
             }
+            C::listen_interrupt(super::private::Event::Threshold);
             Poll::Pending
         }
     }
@@ -1235,10 +1243,10 @@ pub mod asynch {
             Self: Sized,
             D: IntoIterator<Item = T>,
         {
-            // Self::clear_interrupts();
-            // Self::listen_interrupt(super::private::Event::End);
-            // Self::listen_interrupt(super::private::Event::Error);
-            // Self::listen_interrupt(super::private::Event::Threshold);
+            Self::clear_interrupts();
+            Self::listen_interrupt(super::private::Event::End);
+            Self::listen_interrupt(super::private::Event::Error);
+            Self::listen_interrupt(super::private::Event::Threshold);
             let mut data = data.into_iter().fuse();
             Self::send_raw(&mut data, false, 0);
 
@@ -1576,7 +1584,12 @@ mod private {
                 sent = idx;
             }
 
-            Self::set_threshold((constants::RMT_CHANNEL_RAM_SIZE / 2) as u8);
+            Self::set_threshold(if sent < constants::RMT_CHANNEL_RAM_SIZE {
+                sent + 1
+            } else {
+                constants::RMT_CHANNEL_RAM_SIZE / 2
+            } as u8);
+            Self::reset_threshold_set();
             Self::set_continuous(continuous);
             Self::set_generate_repeat_interrupt(repeat);
             Self::set_wrap_mode(true);
