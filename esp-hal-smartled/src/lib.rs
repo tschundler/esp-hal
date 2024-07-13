@@ -30,7 +30,10 @@ use esp_hal::{
     clock::Clocks,
     gpio::OutputPin,
     peripheral::Peripheral,
-    rmt::{Error as RmtError, PulseCode, TxChannel, TxChannelConfig, TxChannelCreator},
+    rmt::{
+        asynch::TxChannelAsync, Error as RmtError, PulseCode, TxChannel, TxChannelConfig,
+        TxChannelCreator, TxChannelCreatorAsync,
+    },
 };
 use smart_leds_trait::{SmartLedsWrite, RGB8};
 
@@ -271,6 +274,83 @@ where
                 self.channel = Some(chan);
                 Err(LedAdapterError::TransmissionError(e))
             }
+        }
+    }
+}
+
+/// Adapter taking an RMT channel and a specific pin and providing RGB LED
+/// interaction functionality using the `smart-leds` crate
+pub struct SmartLedsAdapterAsync<TX>
+where
+    TX: TxChannelAsync,
+{
+    channel: Option<TX>,
+    pulses: (u32, u32),
+}
+
+impl<'d, TX> SmartLedsAdapterAsync<TX>
+where
+    TX: TxChannelAsync,
+{
+    /// Create a new adapter object that drives the pin using the RMT channel.
+    pub fn new<C, O>(
+        channel: C,
+        pin: impl Peripheral<P = O> + 'd,
+        clocks: &Clocks,
+    ) -> SmartLedsAdapterAsync<TX>
+    where
+        O: OutputPin + 'd,
+        C: TxChannelCreatorAsync<'d, TX, O>,
+    {
+        let config = TxChannelConfig {
+            clk_divider: 1,
+            idle_output_level: false,
+            carrier_modulation: false,
+            idle_output: true,
+
+            ..TxChannelConfig::default()
+        };
+
+        let channel = channel.configure(pin, config).unwrap();
+
+        // Assume the RMT peripheral is set up to use the APB clock
+        let src_clock = clocks.apb_clock.to_MHz();
+
+        Self {
+            channel: Some(channel),
+            pulses: (
+                u32::from(PulseCode {
+                    level1: true,
+                    length1: ((SK68XX_T0H_NS * src_clock) / 1000) as u16,
+                    level2: false,
+                    length2: ((SK68XX_T0L_NS * src_clock) / 1000) as u16,
+                }),
+                u32::from(PulseCode {
+                    level1: true,
+                    length1: ((SK68XX_T1H_NS * src_clock) / 1000) as u16,
+                    level2: false,
+                    length2: ((SK68XX_T1L_NS * src_clock) / 1000) as u16,
+                }),
+            ),
+        }
+    }
+
+    /// Convert all RGB8 items of the iterator to the RMT format and
+    /// add them to internal buffer, then start a singular RMT operation
+    /// based on that buffer.
+    pub async fn write<T, I>(&mut self, iterator: T) -> Result<(), LedAdapterError>
+    where
+        T: IntoIterator<Item = I>,
+        I: Into<RGB8>,
+    {
+        let channel = self.channel.as_mut().unwrap();
+        let mut itr = PulseGenerator::new(
+            ByteGenerator::new(iterator.into_iter().map(|v| v.into())),
+            self.pulses,
+        );
+        match channel.transmit(&mut itr).await {
+            Ok(()) => Ok(()),
+            Err(e) => Err(LedAdapterError::TransmissionError(e)),
         }
     }
 }

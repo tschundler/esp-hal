@@ -1,3 +1,5 @@
+#![feature(associated_type_bounds)]
+
 //! # Remote Control Peripheral (RMT)
 //!
 //! ## Overview
@@ -286,10 +288,7 @@ impl<'d> Rmt<'d, crate::Async> {
         _clocks: &Clocks,
     ) -> Result<Self, Error> {
         Self::new_internal(
-            peripheral,
-            frequency,
-            _clocks,
-            Some(asynch::async_interrupt_handler),
+            peripheral, frequency, _clocks, None, //Some(asynch::async_interrupt_handler),
         )
     }
 }
@@ -481,7 +480,7 @@ where
         }
         <C as private::TxChannelInternal<crate::Blocking>>::reset_threshold_set();
 
-        // re-fill RX RAM
+        // re-fill TX RAM
         let ptr = (constants::RMT_RAM_START
             + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4)
             as *mut u32;
@@ -1014,11 +1013,11 @@ pub trait TxChannel: private::TxChannelInternal<crate::Blocking> {
         D: IntoIterator<Item = T, IntoIter = R>,
         R: Iterator<Item = T>,
     {
-        let mut data = data.into_iter();
+        let mut data = data.into_iter().fuse();
         Self::send_raw(&mut data, false, 0);
         SingleShotTxTransaction {
             channel: self,
-            data: data.fuse(),
+            data,
             ram_index: 0,
         }
     }
@@ -1142,41 +1141,90 @@ pub mod asynch {
     const INIT: AtomicWaker = AtomicWaker::new();
     static WAKER: [AtomicWaker; NUM_CHANNELS] = [INIT; NUM_CHANNELS];
 
-    pub(crate) struct RmtTxFuture<T>
+    pub(crate) struct RmtTxFuture<C, D, T: Into<u32> + Copy>
     where
-        T: TxChannelAsync,
+        C: TxChannelAsync,
+        D: Iterator<Item = T>,
     {
-        _phantom: PhantomData<T>,
+        _phantom: PhantomData<C>,
+        data: Fuse<D>,
+        ram_index: usize,
     }
 
-    impl<T> RmtTxFuture<T>
+    impl<C, D, T> RmtTxFuture<C, D, T>
     where
-        T: TxChannelAsync,
+        C: TxChannelAsync,
+        T: Into<u32> + Copy,
+        D: Iterator<Item = T>,
     {
-        pub fn new(_instance: &T) -> Self {
+        pub fn new(_instance: &C, data: Fuse<D>) -> Self {
             Self {
                 _phantom: PhantomData,
+                data,
+                ram_index: 0,
             }
         }
     }
 
-    impl<T> core::future::Future for RmtTxFuture<T>
+    impl<C, D, T> core::future::Future for RmtTxFuture<C, D, T>
     where
-        T: TxChannelAsync,
+        C: TxChannelAsync,
+        T: Into<u32> + Copy,
+        D: Iterator<Item = T>,
     {
-        type Output = ();
+        type Output = Result<(), Error>;
 
-        fn poll(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-            WAKER[T::CHANNEL as usize].register(ctx.waker());
+        fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
+            //WAKER[C::CHANNEL as usize].register(ctx.waker());
 
-            if T::is_error() || T::is_done() {
-                Poll::Ready(())
-            } else {
-                Poll::Pending
+            if C::is_error() {
+                return Poll::Ready(Err(Error::TransmissionError));
             }
+
+            if C::is_done() {
+                return Poll::Ready(Ok(()));
+            }
+
+            // never gets set :|
+            if !C::is_threshold_set() {
+                return Poll::Pending;
+            }
+            C::reset_threshold_set();
+
+            // re-fill TX RAM
+            let ptr = (constants::RMT_RAM_START
+                + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4)
+                as *mut u32;
+
+            loop {
+                let Some(v) = self.data.next() else {
+                    break;
+                };
+                unsafe {
+                    ptr.add(self.ram_index).write_volatile(v.into());
+                }
+                self.ram_index += 1;
+                if self.ram_index == constants::RMT_CHANNEL_RAM_SIZE {
+                    self.ram_index = 0;
+                    break;
+                }
+                if self.ram_index == (constants::RMT_CHANNEL_RAM_SIZE / 2) {
+                    break;
+                }
+            }
+            if C::is_threshold_set() {
+                return Poll::Ready(Err(Error::Underflow));
+            }
+            Poll::Pending
         }
     }
-
+    impl<C, D, T> Unpin for RmtTxFuture<C, D, T>
+    where
+        C: TxChannelAsync,
+        T: Into<u32> + Copy,
+        D: Iterator<Item = T>,
+    {
+    }
     /// TX channel in async mode
     pub trait TxChannelAsync: private::TxChannelInternal<crate::Async> {
         /// Start transmitting the given pulse code sequence.
@@ -1187,19 +1235,14 @@ pub mod asynch {
             Self: Sized,
             D: IntoIterator<Item = T>,
         {
-            Self::clear_interrupts();
-            Self::listen_interrupt(super::private::Event::End);
-            Self::listen_interrupt(super::private::Event::Error);
-            let mut data = data.into_iter();
+            // Self::clear_interrupts();
+            // Self::listen_interrupt(super::private::Event::End);
+            // Self::listen_interrupt(super::private::Event::Error);
+            // Self::listen_interrupt(super::private::Event::Threshold);
+            let mut data = data.into_iter().fuse();
             Self::send_raw(&mut data, false, 0);
 
-            RmtTxFuture::new(self).await;
-
-            if Self::is_error() {
-                Err(Error::TransmissionError)
-            } else {
-                Ok(())
-            }
+            RmtTxFuture::new(self, data).await
         }
     }
 
