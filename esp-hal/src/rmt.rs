@@ -297,7 +297,8 @@ impl<'d> Rmt<'d, crate::Async> {
             peripheral,
             frequency,
             _clocks,
-            Some(asynch::async_interrupt_handler),
+            None,
+            //Some(asynch::async_interrupt_handler),
         )
     }
 }
@@ -1158,6 +1159,7 @@ pub mod asynch {
         _phantom: PhantomData<C>,
         data: Fuse<D>,
         ram_index: usize,
+        c: u32,
     }
 
     impl<C, D, T> RmtTxFuture<C, D, T>
@@ -1171,6 +1173,7 @@ pub mod asynch {
                 _phantom: PhantomData,
                 data,
                 ram_index: 0,
+                c: 0,
             }
         }
     }
@@ -1184,8 +1187,7 @@ pub mod asynch {
         type Output = Result<(), Error>;
 
         fn poll(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Self::Output> {
-            WAKER[C::CHANNEL as usize].register(ctx.waker());
-            //
+            //WAKER[C::CHANNEL as usize].register(ctx.waker());
 
             if C::is_error() {
                 return Poll::Ready(Err(Error::TransmissionError));
@@ -1197,12 +1199,13 @@ pub mod asynch {
 
             // never gets set :|
             if !C::is_threshold_set() {
-                C::clear_interrupts();
+                //C::listen_interrupt(super::private::Event::End);
+                //C::listen_interrupt(super::private::Event::Error);
+                //C::listen_interrupt(super::private::Event::Threshold);
+                ctx.waker().wake_by_ref();
                 return Poll::Pending;
             }
-            panic!("loop");
             C::reset_threshold_set();
-            C::clear_interrupts();
 
             // re-fill TX RAM
             let ptr = (constants::RMT_RAM_START
@@ -1225,10 +1228,25 @@ pub mod asynch {
                     break;
                 }
             }
+            // let rmt = unsafe { &*crate::peripherals::RMT::PTR };
+            // let v= rmt.int_raw().read().bits();
+            // let th= rmt.ch_tx_lim(0).read().bits();
+            // let st= rmt.ch_tx_lim(0).read().bits();
+            // if v != 0 {
+            //     let th= rmt.ch_tx_lim(1).read().bits();
+            //     let st= rmt.ch0status().read().bits();
+            //     let sts = rmt.ch0status().read().state();
+            //     let stsr = rmt.ch0status().read().mem_raddr_ex();
+            //         panic!("vv: {:#x} th: {:#x} st:{:#x} ({}/{}) r: {}", v, th, st,sts.bits(),stsr.bits(),self.ram_index);
+            // }
             if C::is_threshold_set() {
                 return Poll::Ready(Err(Error::Underflow));
             }
-            C::listen_interrupt(super::private::Event::Threshold);
+
+            //C::listen_interrupt(super::private::Event::End);
+            //C::listen_interrupt(super::private::Event::Error);
+            //C::listen_interrupt(super::private::Event::Threshold);
+            ctx.waker().wake_by_ref();
             Poll::Pending
         }
     }
@@ -1249,13 +1267,12 @@ pub mod asynch {
             Self: Sized,
             D: IntoIterator<Item = T>,
         {
-            Self::clear_interrupts();
-            Self::listen_interrupt(super::private::Event::End);
-            Self::listen_interrupt(super::private::Event::Error);
-            Self::listen_interrupt(super::private::Event::Threshold);
+            Self::unlisten_interrupt(super::private::Event::Threshold);
+            Self::unlisten_interrupt(super::private::Event::End);
+            Self::unlisten_interrupt(super::private::Event::Error);
+
             let mut data = data.into_iter().fuse();
             Self::send_raw(&mut data, false, 0);
-
             RmtTxFuture::new(self, data).await
         }
     }
@@ -1342,12 +1359,16 @@ pub mod asynch {
 
             match channel {
                 0 => {
+                    //super::Channel::<crate::Async, 0>::reset_threshold_set();
                     super::Channel::<crate::Async, 0>::unlisten_interrupt(Event::End);
                     super::Channel::<crate::Async, 0>::unlisten_interrupt(Event::Error);
+                    super::Channel::<crate::Async, 0>::unlisten_interrupt(Event::Threshold);
                 }
                 1 => {
+                    //super::Channel::<crate::Async, 1>::reset_threshold_set();
                     super::Channel::<crate::Async, 1>::unlisten_interrupt(Event::End);
                     super::Channel::<crate::Async, 1>::unlisten_interrupt(Event::Error);
+                    super::Channel::<crate::Async, 1>::unlisten_interrupt(Event::Threshold);
                 }
                 2 => {
                     super::Channel::<crate::Async, 2>::unlisten_interrupt(Event::End);
@@ -1389,129 +1410,25 @@ pub mod asynch {
     #[cfg(any(esp32, esp32s2))]
     #[handler]
     pub(super) fn async_interrupt_handler() {
+        let rmt = unsafe { &*crate::peripherals::RMT::PTR };
+        let iv = rmt.int_st().read().bits();
+
+            // //let rmt = unsafe { &*crate::peripherals::RMT::PTR };
+            // let v= rmt.int_raw().read().bits();
+            // let ie= rmt.int_ena().read().bits();
+            // let th= rmt.ch_tx_lim(0).read().bits();
+            // let st= rmt.ch_tx_lim(0).read().bits();
+            // if v > 5 {
+            //     let th= rmt.ch_tx_lim(1).read().bits();
+            //     let st= rmt.ch0status().read().bits();
+            //     let sts = rmt.ch0status().read().state();
+            //     let stsr = rmt.ch0status().read().mem_raddr_ex();
+            //         panic!("vi: {:#x} th: {:#x} st:{:#x} ({}/{}) iv: {:#x}/{:#x}", v, th, st,sts.bits(),stsr.bits(), iv, ie);
+            // }
+
+        rmt.int_ena().modify(|r, w| unsafe { w.bits(r.bits() & !iv) });
         if let Some(channel) = super::chip_specific::pending_interrupt_for_channel() {
-            match channel {
-                0 => {
-                    <Channel<crate::Async,0> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,0> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,0> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,0> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-                1 => {
-                    <Channel<crate::Async,1> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,1> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,1> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,1> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-                2 => {
-                    <Channel<crate::Async,2> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,2> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,2> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,2> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-                3 => {
-                    <Channel<crate::Async,3> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,3> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,3> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,3> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-                #[cfg(esp32)]
-                4 => {
-                    <Channel<crate::Async,4> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,4> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,4> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,4> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-                #[cfg(any(esp32, esp32s3))]
-                5 => {
-                    <Channel<crate::Async,5> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,5> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,5> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,5> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-                #[cfg(any(esp32, esp32s3))]
-                6 => {
-                    <Channel<crate::Async,6> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,6> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,6> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,6> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-                #[cfg(any(esp32, esp32s3))]
-                7 => {
-                    <Channel<crate::Async,7> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,7> as super::private::TxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                    <Channel<crate::Async,7> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::End,
-                    );
-                    <Channel<crate::Async,7> as super::private::RxChannelInternal<crate::Async>>::unlisten_interrupt(
-                        Event::Error,
-                    );
-                }
-
-                _ => unreachable!(),
-            }
-
-            WAKER[channel].wake();
+                  WAKER[channel].wake();
         }
     }
 }
@@ -1589,9 +1506,10 @@ mod private {
                 }
                 sent = idx;
             }
+            sent += 1;
 
-            Self::set_threshold(if sent < constants::RMT_CHANNEL_RAM_SIZE {
-                sent + 1
+            Self::set_threshold(if sent < constants::RMT_CHANNEL_RAM_SIZE  {
+                sent
             } else {
                 constants::RMT_CHANNEL_RAM_SIZE / 2
             } as u8);
