@@ -37,10 +37,10 @@ use esp_hal::{
 };
 use smart_leds_trait::{SmartLedsWrite, RGB8};
 
-const SK68XX_CODE_PERIOD: u32 = 1200; // 800kHz
-const SK68XX_T0H_NS: u32 = 400; // 300ns per SK6812 datasheet. Some require >350ns for T0H. Others <500ns for T0H.
+const SK68XX_CODE_PERIOD: u32 = 1250; // 800kHz
+const SK68XX_T0H_NS: u32 = 400; // 300ns per SK6812 datasheet, 400 per WS2812. Some require >350ns for T0H. Others <500ns for T0H.
 const SK68XX_T0L_NS: u32 = SK68XX_CODE_PERIOD - SK68XX_T0H_NS;
-const SK68XX_T1H_NS: u32 = 900; // > 550ns is typically enough, SK6812 datasheet specifies 900ns. Some require >900ns for T1H.
+const SK68XX_T1H_NS: u32 = 900; // > 550ns is typically enough, SK6812 datasheet specifies 900ns, WS2812 specifies 850. Some require.
 const SK68XX_T1L_NS: u32 = SK68XX_CODE_PERIOD - SK68XX_T1H_NS;
 const SK68XX_TLATCH_NS: u32 = 20000;
 
