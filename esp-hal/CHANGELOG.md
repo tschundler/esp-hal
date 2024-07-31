@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Allow DMA to/from psram for esp32s3 (#1827)
 - DMA buffers now don't require a static lifetime. Make sure to never `mem::forget` an in-progress DMA transfer (consider using `#[deny(clippy::mem_forget)]`) (#1837)
+- RMT blocking `transmit` now accepts an iterator instead of slice.
+- RMT peripheral has a new error type, `Underflow`, for buffer underruns.
 
 ### Fixed
 

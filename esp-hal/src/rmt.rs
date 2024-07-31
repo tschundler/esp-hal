@@ -81,7 +81,7 @@
 
 #![warn(missing_docs)]
 
-use core::marker::PhantomData;
+use core::{iter::Fuse, borrow::Borrow, marker::PhantomData};
 
 use fugit::HertzU32;
 
@@ -108,6 +108,8 @@ pub enum Error {
     InvalidArgument,
     /// An error occurred during transmission
     TransmissionError,
+    /// Input iterator was unable to provide data to refill the ring buffer in time
+    Underflow,
 }
 
 /// Convenience representation of a pulse code entry.
@@ -456,71 +458,76 @@ where
 }
 
 /// An in-progress transaction for a single shot TX transaction.
-pub struct SingleShotTxTransaction<'a, C, T: Into<u32> + Copy>
+pub struct SingleShotTxTransaction<C, I, B, T: Into<u32> + Copy>
 where
     C: TxChannel,
+    B: Borrow<T>,
+    I: Iterator<Item=B>
 {
     channel: C,
     index: usize,
-    data: &'a [T],
+    data: Fuse<I>,
+    _phantom: PhantomData<T>,
 }
 
-impl<'a, C, T: Into<u32> + Copy> SingleShotTxTransaction<'a, C, T>
+impl<C, I, B, T: Into<u32> + Copy> SingleShotTxTransaction<C, I, B, T>
 where
     C: TxChannel,
+    B: Borrow<T>,
+    I: Iterator<Item=B>
 {
+    /// Fill half of the ring buffer.
+    fn fill_ram(&mut self) -> Result<(), Error>{
+        let ptr = (constants::RMT_RAM_START
+            + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4
+            + self.index * 4)
+            as *mut u32;
+
+        for (i, entry) in (&mut self.data).take(constants::RMT_CHANNEL_RAM_SIZE/2).enumerate() {
+            unsafe {
+                ptr.add(i).write_volatile((*entry.borrow()).into());
+            }
+        }
+
+        if self.index == 0 {
+            self.index = constants::RMT_CHANNEL_RAM_SIZE/2;
+        } else {
+            self.index = 0;
+        }
+
+        if <C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
+            return Err(Error::Underflow);
+        }
+        Ok(())
+    }
+
+    // Poll checks if the transaction is done. If the ring buffer is ready for more data, this fills it.
+    fn poll(&mut self) -> Option<Result<(), Error>> {
+        if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
+            return Some(Err(Error::TransmissionError));
+        }
+        if <C as private::TxChannelInternal<crate::Blocking>>::is_done() {
+            return Some(Ok(()));
+        }
+        if !<C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
+            return None;
+        }
+        <C as private::TxChannelInternal<crate::Blocking>>::reset_threshold_set();
+
+        Some(self.fill_ram())
+    }
+
     /// Wait for the transaction to complete
     pub fn wait(mut self) -> Result<C, (Error, C)> {
-        loop {
-            if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
-                return Err((Error::TransmissionError, self.channel));
-            }
-
-            if self.index < self.data.len() {
-                // wait for TX-THR
-                loop {
-                    if <C as private::TxChannelInternal<crate::Blocking>>::is_threshold_set() {
-                        break;
-                    }
-                }
-                <C as private::TxChannelInternal<crate::Blocking>>::reset_threshold_set();
-
-                // re-fill TX RAM
-                let ram_index = (((self.index - constants::RMT_CHANNEL_RAM_SIZE)
-                    / (constants::RMT_CHANNEL_RAM_SIZE / 2))
-                    % 2)
-                    * (constants::RMT_CHANNEL_RAM_SIZE / 2);
-
-                let ptr = (constants::RMT_RAM_START
-                    + C::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4
-                    + ram_index * 4) as *mut u32;
-                for (idx, entry) in self.data[self.index..]
-                    .iter()
-                    .take(constants::RMT_CHANNEL_RAM_SIZE / 2)
-                    .enumerate()
-                {
-                    unsafe {
-                        ptr.add(idx).write_volatile((*entry).into());
-                    }
-                }
-
-                self.index += constants::RMT_CHANNEL_RAM_SIZE / 2;
-            } else {
-                break;
-            }
-        }
 
         loop {
-            if <C as private::TxChannelInternal<crate::Blocking>>::is_error() {
-                return Err((Error::TransmissionError, self.channel));
-            }
-
-            if <C as private::TxChannelInternal<crate::Blocking>>::is_done() {
-                break;
+            if let Some(result) = self.poll() {
+                match result {
+                    Ok(()) => return Ok(self.channel),
+                    Err(e) => return Err((e, self.channel)),
+                }
             }
         }
-
-        Ok(self.channel)
     }
 }
 
@@ -995,15 +1002,20 @@ pub trait TxChannel: private::TxChannelInternal<crate::Blocking> {
     /// This returns a [`SingleShotTxTransaction`] which can be used to wait for
     /// the transaction to complete and get back the channel for further
     /// use.
-    fn transmit<T: Into<u32> + Copy>(self, data: &[T]) -> SingleShotTxTransaction<Self, T>
+    fn transmit<D, I, B, T: Into<u32> + Copy>(self, data: D) -> SingleShotTxTransaction<Self, I, B, T>
     where
         Self: Sized,
+        B: Borrow<T>,
+        D: IntoIterator<Item = B, IntoIter = I>,
+        I: Iterator<Item = B>,
     {
-        let index = Self::send_raw(data, false, 0);
+        let mut data = data.into_iter().fuse();
+        Self::send_raw(&mut data, false, 0);
         SingleShotTxTransaction {
             channel: self,
-            index,
             data,
+            index: 0,
+            _phantom: PhantomData,
         }
     }
 
@@ -1036,7 +1048,7 @@ pub trait TxChannel: private::TxChannelInternal<crate::Blocking> {
             return Err(Error::Overflow);
         }
 
-        let _index = Self::send_raw(data, true, loopcount);
+        Self::send_raw(data.iter().copied(), true, loopcount);
         Ok(ContinuousTxTransaction { channel: self })
     }
 }
@@ -1178,7 +1190,7 @@ pub mod asynch {
             Self::clear_interrupts();
             Self::listen_interrupt(super::private::Event::End);
             Self::listen_interrupt(super::private::Event::Error);
-            Self::send_raw(data, false, 0);
+            Self::send_raw(data.iter().copied(), false, 0);
 
             RmtTxFuture::new(self).await;
 
@@ -1448,6 +1460,7 @@ pub mod asynch {
 
 mod private {
     use crate::{peripheral::Peripheral, soc::constants};
+    use core::borrow::Borrow;
 
     pub enum Event {
         Error,
@@ -1501,19 +1514,22 @@ mod private {
 
         fn is_loopcount_interrupt_set() -> bool;
 
-        fn send_raw<T: Into<u32> + Copy>(data: &[T], continuous: bool, repeat: u16) -> usize {
+        fn send_raw<B, T: Into<u32> + Copy>(data: impl Iterator<Item = B>,
+        continuous: bool, repeat: u16)
+        where
+            B: Borrow<T>,
+        {
             Self::clear_interrupts();
 
             let ptr = (constants::RMT_RAM_START
                 + Self::CHANNEL as usize * constants::RMT_CHANNEL_RAM_SIZE * 4)
                 as *mut u32;
             for (idx, entry) in data
-                .iter()
                 .take(constants::RMT_CHANNEL_RAM_SIZE)
                 .enumerate()
             {
                 unsafe {
-                    ptr.add(idx).write_volatile((*entry).into());
+                    ptr.add(idx).write_volatile((*entry.borrow()).into());
                 }
             }
 
@@ -1525,12 +1541,6 @@ mod private {
             Self::update();
             Self::start_tx();
             Self::update();
-
-            if data.len() >= constants::RMT_CHANNEL_RAM_SIZE {
-                constants::RMT_CHANNEL_RAM_SIZE
-            } else {
-                data.len()
-            }
         }
 
         fn stop();
